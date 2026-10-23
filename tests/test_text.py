@@ -14,13 +14,21 @@ def test_list_items_and_quotes_are_paragraphs():
     assert [p.words for p in report.paragraphs] == [2, 3, 2]
 
 
-def test_headings_and_table_cells_count_toward_words_but_are_not_paragraphs():
-    markdown = "# Big heading here\n\n| a b | c |\n|---|---|\n| d | e f |\n"
+def test_headings_count_toward_words_but_are_not_blocks():
+    report = analyze_text("# Big heading here\n\nOne two.\n")
+
+    assert [p.words for p in report.paragraphs] == [2]
+    assert report.words == 3 + 2
+
+
+def test_table_cells_are_blocks_with_their_row_line():
+    markdown = "| a b | c |\n|---|---|\n| d | e f g |\n"
 
     report = analyze_text(markdown)
 
-    assert report.paragraphs == []
-    assert report.words == 3 + 3 + 3
+    assert [(p.kind, p.line, p.words) for p in report.paragraphs] == [
+        ("cell", 1, 2), ("cell", 1, 1), ("cell", 3, 1), ("cell", 3, 3),
+    ]
 
 
 def test_code_blocks_are_not_words():

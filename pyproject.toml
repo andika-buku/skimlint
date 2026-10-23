@@ -21,6 +21,7 @@ visual = [
     "scikit-image>=0.21",
     "playwright>=1.40",
 ]
+language = ["spacy>=3.7,<3.9"]
 test = ["pytest>=8"]
 
 [project.scripts]

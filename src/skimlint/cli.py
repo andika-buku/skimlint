@@ -11,7 +11,7 @@ from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Dict, List, Tuple
 
-from . import __version__
+from . import __version__, fitness
 from .text import TextReport, analyze_text
 
 DEFAULT_MAX_PARAGRAPH_WORDS = 55
@@ -21,13 +21,21 @@ def _parse_args(argv: List[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="skimlint",
         description="Flags Markdown that reads as a slog at a glance: long paragraphs, "
-        "dense inline code, and, with --visual, AIM visual clutter scores.",
+        "dense inline code, hard-to-parse sentences (--language), and AIM visual clutter (--visual). "
+        "Each file also gets a fitness score from 0 to 100.",
     )
     parser.add_argument("paths", nargs="+", help="Markdown files or directories; '-' reads stdin")
     parser.add_argument("--max-paragraph-words", type=int, default=DEFAULT_MAX_PARAGRAPH_WORDS, metavar="N",
-                        help=f"fail on a paragraph or list item over N words (default {DEFAULT_MAX_PARAGRAPH_WORDS}, 0 = off)")
+                        help="fail on a paragraph, list item, or table cell over N words "
+                        f"(default {DEFAULT_MAX_PARAGRAPH_WORDS}, 0 = off)")
     parser.add_argument("--max-code-spans", type=int, default=0, metavar="N",
                         help="fail on a paragraph with more than N inline code spans (default off)")
+    parser.add_argument("--language", action="store_true",
+                        help="parse sentences with spaCy: dependency distance and coherence")
+    parser.add_argument("--spacy-model", default=None, metavar="NAME",
+                        help="spaCy model for --language (default en_core_web_md)")
+    parser.add_argument("--max-dependency-distance", type=float, default=0, metavar="X",
+                        help="fail on a sentence with a mean dependency distance above X (default off; needs --language)")
     parser.add_argument("--visual", action="store_true",
                         help="render each file and score its screens with AIM clutter metrics")
     parser.add_argument("--metrics", default="m1,m2,m3,m4,m5,m6,m7,m8,m13",
@@ -43,11 +51,16 @@ def _parse_args(argv: List[str] | None) -> argparse.Namespace:
     parser.add_argument("--chromium", metavar="PATH",
                         help="Chromium executable for --visual (or set SKIMLINT_CHROMIUM)")
     parser.add_argument("--save-screenshots", metavar="DIR", help="write the scored screens as PNG files")
-    parser.add_argument("--format", choices=("text", "json"), default="text")
+    parser.add_argument("--format", choices=("text", "json", "fitness"), default="text",
+                        help="fitness prints one tab-separated 'score path' line per file")
     parser.add_argument("--version", action="version", version=f"skimlint {__version__}")
     args = parser.parse_args(argv)
     if args.max_screens < 1:
         parser.error("--max-screens must be at least 1")
+    if args.max_dependency_distance and not args.language:
+        parser.error("--max-dependency-distance needs --language")
+    if args.spacy_model and not args.language:
+        parser.error("--spacy-model needs --language")
     args.metric_ids = [m.strip() for m in args.metrics.split(",") if m.strip()]
     args.limits = {}
     for item in args.fail_above:
@@ -85,7 +98,8 @@ def _text_findings(report: TextReport, args: argparse.Namespace) -> List[Dict]:
         if args.max_paragraph_words and p.words > args.max_paragraph_words:
             findings.append({
                 "line": p.line, "rule": "long-paragraph",
-                "message": f"paragraph has {p.words} words (max {args.max_paragraph_words}): \"{p.preview} …\"",
+                "message": f"{'table cell' if p.kind == 'cell' else 'paragraph'} has {p.words} words "
+                           f"(max {args.max_paragraph_words}): \"{p.preview} …\"",
             })
         if args.max_code_spans and p.code_spans > args.max_code_spans:
             findings.append({
@@ -93,6 +107,17 @@ def _text_findings(report: TextReport, args: argparse.Namespace) -> List[Dict]:
                 "message": f"paragraph has {p.code_spans} inline code spans (max {args.max_code_spans})",
             })
     return findings
+
+
+def _language_findings(language, limit: float) -> List[Dict]:
+    return [
+        {
+            "line": s.line, "rule": "hard-sentence",
+            "message": f"sentence has dependency distance {s.dependency_distance:.2f} (max {limit:g}): \"{s.preview} …\"",
+        }
+        for s in language.sentences
+        if limit and s.dependency_distance > limit
+    ]
 
 
 def _score_screen(job: Tuple[bytes, List[str]]) -> Dict[str, float]:
@@ -161,14 +186,24 @@ def _print_text(results: List[Dict]) -> None:
         longest = f"{t['longest_paragraph_words']} words"
         if t["longest_paragraph_line"]:
             longest += f" (line {t['longest_paragraph_line']})"
-        print(f"  words {t['words']} · paragraphs {t['paragraphs']} · longest {longest}"
-              f" · most inline code spans in one paragraph {t['max_code_spans']}")
+        print(f"  words {t['words']} · blocks {t['paragraphs']} · longest {longest}"
+              f" · most inline code spans in one block {t['max_code_spans']}")
+        if "language" in r:
+            lang = r["language"]
+            if lang["sentences"]:
+                coherence = f"{lang['coherence_mean']:.2f}" if lang["coherence_mean"] is not None else "n/a"
+                print(f"  sentences {lang['sentences']} · dependency distance mean {lang['dependency_distance_mean']:.2f}"
+                      f", p90 {lang['dependency_distance_p90']:.2f} · coherence {coherence}")
         if "visual" in r:
             screens = len(r["visual"]["screens"])
             print(f"  visual, {screens} screen{'s' if screens != 1 else ''}:")
             for metric_id, s in r["visual"]["summary"].items():
                 print(f"    {metric_id:<4} {s['name']:<24} first {s['first']:<10.4g} "
                       f"max {s['max']:.4g} (screen {s['max_screen']})")
+        fit = r["fitness"]
+        if fit["score"] is not None:
+            parts = ", ".join(f"{k} {v:.2f}" for k, v in fit["components"].items())
+            print(f"  fitness {fit['score']:.1f} ({parts})")
         print()
     failing = sum(1 for r in results if r["findings"])
     print(f"{failing} of {len(results)} file{'s' if len(results) != 1 else ''} failed")
@@ -181,17 +216,45 @@ def main(argv: List[str] | None = None) -> int:
     except OSError as e:
         print(f"skimlint: {e}", file=sys.stderr)
         return 2
+    nlp = None
+    if args.language:
+        from .language import DEFAULT_MODEL, load_model
+
+        try:
+            nlp = load_model(args.spacy_model or DEFAULT_MODEL)
+        except (ImportError, RuntimeError) as e:
+            print(f"skimlint: {e}", file=sys.stderr)
+            return 2
+
     results = []
     for name, markdown in docs:
         report = analyze_text(markdown)
-        results.append({"path": name, "text": report.to_dict(), "findings": _text_findings(report, args)})
+        result = {"path": name, "text": report.to_dict(), "findings": _text_findings(report, args)}
+        components = {"blocks": fitness.blocks_component(report, args.max_paragraph_words)}
+        if nlp is not None:
+            from .language import analyze_language
+
+            language = analyze_language(report.paragraphs, nlp)
+            result["language"] = language.to_dict()
+            result["findings"].extend(_language_findings(language, args.max_dependency_distance))
+            components["sentences"] = fitness.sentences_component(language)
+        result["_components"] = components
+        results.append(result)
     if args.visual and docs:
         for result, visual in zip(results, _visual(docs, args)):
             result["visual"] = visual
             result["findings"].extend(_visual_findings(visual, args.limits))
+            result["_components"]["visual"] = fitness.visual_component(visual)
+    for result in results:
+        result["fitness"] = fitness.score(result.pop("_components"))
+
     if args.format == "json":
         json.dump(results, sys.stdout, indent=2)
         print()
+    elif args.format == "fitness":
+        for r in results:
+            score = r["fitness"]["score"]
+            print(f"{'' if score is None else f'{score:.1f}'}\t{r['path']}")
     else:
         _print_text(results)
     return 1 if any(r["findings"] for r in results) else 0
