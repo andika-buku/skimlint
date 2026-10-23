@@ -1,0 +1,7 @@
+# Retry policy for the sync worker
+
+The sync worker now retries a failed upload with `ExponentialBackoff` instead of the fixed `RETRY_DELAY_MS`, because the old delay hammered the gateway after an outage and kept `SyncQueue` blocked while `UploadJob` waited on `TokenStore.refresh()`, which itself called `AuthClient` with the stale `sessionId`, so the second attempt failed the same way as the first and the queue never drained until the user restarted the app from the `Settings` screen or the `WorkManager` constraint was met again.
+
+To keep the change small, `RetryPolicy` keeps its public shape, `UploadJob.run()` reads the delay from `RetryPolicy.nextDelay(attempt)`, `SyncQueue` stops holding its lock across the network call, and `TokenStore` refreshes once per burst; the tests in `RetryPolicyTest` and `SyncQueueTest` pin the delays at 1, 2, 4, and 8 seconds, cap them at 60 seconds, and check that `UploadJob` gives up after `MAX_ATTEMPTS` with a `SyncFailed` event that the `Home` banner shows until the next successful sync clears it.
+
+Rollout is behind the `sync_backoff_v2` flag, defaulting to off in production and on in staging, and the old path stays in place until the flag has been on for two releases without a rise in `sync_failed` events, at which point a follow-up removes `RETRY_DELAY_MS`, the legacy `FixedDelayPolicy`, and the flag check in `UploadJob`, and updates the runbook that tells support to ask users to restart the app.

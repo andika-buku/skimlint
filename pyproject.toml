@@ -1,0 +1,36 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "skimlint"
+description = "Flags Markdown that reads as a slog at a glance."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+dependencies = ["markdown-it-py>=3"]
+dynamic = ["version"]
+
+[project.optional-dependencies]
+visual = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "opencv-python-headless>=4.8",
+    "pillow>=10",
+    "pyrtools>=1.0.4",
+    "scikit-image>=0.21",
+    "playwright>=1.40",
+]
+test = ["pytest>=8"]
+
+[project.scripts]
+skimlint = "skimlint.cli:main"
+
+[tool.hatch.version]
+path = "src/skimlint/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/skimlint"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
