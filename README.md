@@ -4,13 +4,17 @@ Experimental CLI to prevent unreadable Markdown mess.
 
 A reader decides in a few seconds whether a document is easy or a slog, before they read a word. skimlint measures what drives that first impression:
 
-- **Text checks** (fast, no browser): paragraph size and inline code density, with line numbers.
+- **Text checks** (fast, no browser): block size and inline code density, with line numbers.
+- **Language checks** (`--language`): spaCy parses each sentence and measures its dependency distance, which is how far words sit from the words they attach to.
 - **Visual checks** (`--visual`): skimlint renders the Markdown as GitHub does, cuts the page into 1280×800 screens, and scores each screen with the visual clutter metrics of [Aalto Interface Metrics (AIM)](https://github.com/aalto-ui/aim).
+- **Fitness score**: one number from 0 to 100 per file, built from the checks that ran. Use it as the objective when you tune writing rules in a loop.
 
 ## Install
 
 ```sh
 pip install "skimlint @ git+https://github.com/andika-buku/skimlint"            # text checks
+pip install "skimlint[language] @ git+https://github.com/andika-buku/skimlint"  # + language checks
+python -m spacy download en_core_web_md                                         # once, for --language
 pip install "skimlint[visual] @ git+https://github.com/andika-buku/skimlint"    # + visual checks
 playwright install chromium                                                     # once, for --visual
 ```
@@ -23,7 +27,9 @@ Python 3.10 or later. To use a Chromium that is already installed, pass `--chrom
 skimlint docs/                                        # every *.md file under docs/
 skimlint proposal.md design.md
 gh pr view 123 --json body -q .body | skimlint -      # a PR description from stdin
+skimlint --language --max-dependency-distance 3.5 proposal.md
 skimlint --visual --fail-above m8=5.5 proposal.md
+skimlint --language --visual --format fitness drafts/   # one "score<TAB>path" line per file
 skimlint --format json proposal.md
 ```
 
@@ -49,8 +55,11 @@ tests/fixtures/dense.md
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--max-paragraph-words N` | 55 | Fail on a paragraph or list item over N words. 0 turns it off. |
+| `--max-paragraph-words N` | 55 | Fail on a paragraph, list item, or table cell over N words. 0 turns it off. |
 | `--max-code-spans N` | off | Fail on a paragraph with more than N inline code spans. |
+| `--language` | off | Parse sentences with spaCy. |
+| `--spacy-model NAME` | `en_core_web_md` | spaCy model for `--language`. Coherence needs a model with word vectors. |
+| `--max-dependency-distance X` | off | Fail on a sentence with a mean dependency distance above X. |
 | `--visual` | off | Render each file and score its screens with AIM metrics. |
 | `--metrics LIST` | all | AIM metrics to compute, for example `m4,m8`. |
 | `--fail-above METRIC=VALUE` | none | Fail when any screen scores above VALUE. Repeatable. |
@@ -58,7 +67,7 @@ tests/fixtures/dense.md
 | `--width PX` | 980 | Content column width, as in GitHub's file view. |
 | `--jobs N` | CPU count | Parallel workers for the visual metrics. |
 | `--save-screenshots DIR` | — | Write the scored screens as PNG files. |
-| `--format text\|json` | text | JSON includes every paragraph and every screen's scores. |
+| `--format text\|json\|fitness` | text | JSON includes every block, sentence, and screen. `fitness` prints only the scores. |
 
 ## Checks
 
@@ -66,8 +75,18 @@ tests/fixtures/dense.md
 
 | Rule | Measures |
 |---|---|
-| `long-paragraph` | Words in each paragraph. List items and block quotes count as paragraphs. Headings, table cells, and code blocks do not. |
+| `long-paragraph` | Words in each block of running text: paragraphs, list items, block quotes, and table cells. Headings and code blocks are not blocks. |
 | `dense-inline-code` | Inline code spans in each paragraph. Many grey chips inside running text look noisy. |
+
+### Language (spaCy)
+
+| Rule or measure | Meaning |
+|---|---|
+| `hard-sentence` | A sentence whose mean dependency distance is above `--max-dependency-distance`. Each word's distance is how many words away its head is; the root counts 0. A high value means the reader holds words in memory before they connect, for example a subject far from its verb. |
+| Dependency distance mean and p90 | Over all sentences. Sentences under 3 words are fragments and are skipped. |
+| Coherence | Mean similarity of consecutive sentences inside one block. Reported only: it did not separate easy from awful documents, and one-sentence bullets have no pairs to compare. |
+
+The formulas follow [TextDescriptives](https://github.com/hlasse/textdescriptives). It is not a dependency, because it pins numpy below 2 and the visual metrics need numpy 2.
 
 ### Visual (AIM)
 
@@ -85,18 +104,36 @@ Each metric runs on every 1280×800 screen. The report gives the first screen, w
 | m8 | Feature congestion | More clutter in colour, contrast, and orientation (Rosenholtz et al. 2007) |
 | m13 | Luminance standard deviation | More light-dark variation |
 
+## Fitness score
+
+The score is 100 times the geometric mean of the components that ran. Each component is a share from 0 (worst) to 1 (best):
+
+| Component | Needs | Value |
+|---|---|---|
+| `blocks` | — | Share of block words in blocks within `--max-paragraph-words` |
+| `sentences` | `--language` | Share of sentence words in sentences with a dependency distance of 3.0 or less |
+| `visual` | `--visual` with m8 | First-screen m8: 1 at 4.0 or less, 0 at 6.5 or more, linear between |
+
+A geometric mean means one bad component pulls the score down, and the others cannot make up for it. A component of 0 counts as 0.01, so improving another component still raises the score. The JSON output carries the components and a `version`; compare only scores from the same version and the same flags.
+
+The score has gaps that an optimizer will find. Hold these constant in a loop, or check them separately:
+
+- **Deleting content raises the score.** A one-line document scores 100. Keep the facts fixed, for example by checking the output against the source.
+- **Headings are not blocks.** Text moved into headings escapes the block check.
+- **Fragments are skipped.** Sentences under 3 words do not count, so the score does not reward chopping sentences, but it does not penalize it either.
+
 ## Calibration status
 
 The thresholds are provisional. They come from one reader's verdicts on two pairs of real documents: one pair of PR descriptions and one pair of specs.
 
-| Document | Reader verdict | Longest paragraph | m8, first screen |
-|---|---|---|---|
-| PR description A | easy | 14 words | 4.36 |
-| PR description B | awful | 56 words | 5.65 |
-| Spec C | ok | 52 words | 4.34 |
-| Spec D | awful | 135 words | 6.44 |
+| Document | Reader verdict | Longest block | Mean dependency distance | m8, first screen | Fitness (all three) | Rank among 10 of its kind |
+|---|---|---|---|---|---|---|
+| PR description A | easy | 14 words | 1.74 | 4.36 | 95.4 | 2 |
+| PR description B | awful | 56 words | 2.87 | 5.65 | 54.7 | 10 |
+| Spec C | ok | 52 words | 2.78 | 4.34 | 69.6 | 1 |
+| Spec D | awful | 135 words | 3.52 | 6.44 | 12.9 | 10 |
 
-The default of 55 words passes both documents that the reader accepted and fails both awful ones. m8 separates the same pairs, but two pairs are too few for a default, so no visual check fails unless you set `--fail-above`. Collect more verdicts before you tighten either one.
+The default of 55 words passes both documents that the reader accepted and fails both awful ones. Dependency distance and m8 separate the same pairs. The fitness score ranks each pair at the two ends of a random sample of 10 documents of the same kind, with or without the visual component. Four labelled documents are too few to trust these thresholds, and they are partly fitted to these same documents. So no language or visual check fails unless you set a limit. Collect more verdicts before you tighten anything.
 
 ## Speed
 
@@ -109,7 +146,16 @@ The original AIM code takes about 63 seconds per screen for m1 to m8 and m13, al
 | m8 feature congestion | 31 s | 5.1 s |
 | Others | < 0.1 s each | < 0.1 s each |
 
-The text checks take milliseconds.
+Measured on 20 real documents (8,430 words, 50 screens) on 4 cores:
+
+| Run | Time |
+|---|---|
+| Text checks | 0.3 s |
+| `--language` | 5.7 s: 3.3 s to load the spaCy model once, then about 4,000 words per second |
+| `--visual`, all metrics, all screens | 153 s, about 3 s per screen |
+| `--language --visual --metrics m8 --max-screens 1` | 57 s, about 3 s per document |
+
+The fitness score reads only m8 on the first screen, so the last command gives the same score as a full run. Use it in loops.
 
 ## How the port is verified
 
@@ -120,8 +166,9 @@ One deliberate difference: on a blank screen, m5 and m6 return 0.0, as the AIM c
 ## Development
 
 ```sh
-pip install -e ".[visual,test]"
+pip install -e ".[visual,language,test]"
 playwright install chromium
+python -m spacy download en_core_web_md
 pytest
 ```
 
@@ -129,6 +176,7 @@ pytest
 
 - [Aalto Interface Metrics](https://github.com/aalto-ui/aim), MIT License. Oulasvirta et al., "Aalto Interface Metrics (AIM): A Service and Codebase for Computational GUI Evaluation", UIST 2018 Adjunct.
 - Rosenholtz, Li, and Nakano, "Measuring visual clutter", Journal of Vision, 2007 (m7, m8).
+- [TextDescriptives](https://github.com/hlasse/textdescriptives), Apache License 2.0, for the dependency distance and coherence formulas.
 - [github-markdown-css](https://github.com/sindresorhus/github-markdown-css), MIT License.
 
 See [NOTICE](NOTICE) for the license texts.

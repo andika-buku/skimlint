@@ -1,4 +1,4 @@
-"""Text metrics that need no rendering: paragraph size and inline code density."""
+"""Text metrics that need no rendering: block size and inline code density."""
 
 from __future__ import annotations
 
@@ -16,11 +16,18 @@ def markdown_parser() -> MarkdownIt:
 
 @dataclass
 class Paragraph:
+    """A block of running text: a paragraph, list item, quote, or table cell."""
+
     line: int
+    kind: str  # "paragraph" or "cell"
     words: int
     code_spans: int
     code_words: int
-    preview: str
+    text: str
+
+    @property
+    def preview(self) -> str:
+        return " ".join(self.text.split()[:8])
 
 
 @dataclass
@@ -40,7 +47,10 @@ class TextReport:
             "longest_paragraph_words": longest.words if longest else 0,
             "longest_paragraph_line": longest.line if longest else None,
             "max_code_spans": max((p.code_spans for p in self.paragraphs), default=0),
-            "paragraph_details": [asdict(p) for p in self.paragraphs],
+            "paragraph_details": [
+                {k: v for k, v in asdict(p).items() if k != "text"} | {"preview": p.preview}
+                for p in self.paragraphs
+            ],
         }
 
 
@@ -63,11 +73,16 @@ def _plain_text(inline: Token) -> tuple[str, int, int]:
     return "".join(parts), code_spans, code_words
 
 
-def analyze_text(markdown: str) -> TextReport:
-    """Measures every paragraph, including paragraphs inside list items and quotes.
+_BLOCK_OPENERS = {"paragraph_open": "paragraph", "td_open": "cell", "th_open": "cell"}
 
-    Headings, table cells, and code blocks are not paragraphs. They count toward
-    the document's total words, except code blocks.
+
+def analyze_text(markdown: str) -> TextReport:
+    """Measures every block of running text.
+
+    Paragraphs inside list items and quotes count as paragraphs. Table cells are
+    blocks too, so a wall of text cannot hide in a table. Headings and code
+    blocks are not blocks; headings count toward the total words, code blocks
+    do not.
     """
     tokens = markdown_parser().parse(markdown)
     report = TextReport(words=0)
@@ -77,8 +92,15 @@ def analyze_text(markdown: str) -> TextReport:
         text, code_spans, code_words = _plain_text(token)
         words = len(text.split())
         report.words += words
-        if i > 0 and tokens[i - 1].type == "paragraph_open":
-            line = (token.map[0] + 1) if token.map else 0
-            preview = " ".join(text.split()[:8])
-            report.paragraphs.append(Paragraph(line, words, code_spans, code_words, preview))
+        kind = _BLOCK_OPENERS.get(tokens[i - 1].type) if i > 0 else None
+        if kind and words:
+            report.paragraphs.append(Paragraph(_line(tokens, i), kind, words, code_spans, code_words, text))
     return report
+
+
+def _line(tokens: List[Token], i: int) -> int:
+    """1-based source line of token i. Table cells carry no map, so use their row's."""
+    for token in reversed(tokens[: i + 1]):
+        if token.map:
+            return token.map[0] + 1
+    return 0

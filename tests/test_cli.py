@@ -3,6 +3,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 from skimlint.cli import main
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -47,3 +49,27 @@ def test_stdin(monkeypatch, capsys):
 def test_missing_file_exits_2(capsys):
     assert main(["no-such-file.md"]) == 2
     assert "no-such-file.md" in capsys.readouterr().err
+
+
+def test_long_table_cell_fails(tmp_path, capsys):
+    doc = tmp_path / "table.md"
+    doc.write_text("| a | b |\n|---|---|\n| " + "word " * 60 + "| x |\n")
+
+    assert main([str(doc)]) == 1
+    assert "table cell has 60 words" in capsys.readouterr().out
+
+
+def test_fitness_format_prints_score_and_path(capsys):
+    main(["--format", "fitness", str(FIXTURES / "clean.md"), str(FIXTURES / "dense.md")])
+
+    lines = [line.split("\t") for line in capsys.readouterr().out.splitlines()]
+    assert [Path(path).name for _, path in lines] == ["clean.md", "dense.md"]
+    clean, dense = (float(score) for score, _ in lines)
+    assert clean == 100.0
+    assert dense < 10
+
+
+def test_language_options_need_language():
+    for option in (["--max-dependency-distance", "3"], ["--spacy-model", "x"]):
+        with pytest.raises(SystemExit):
+            main([*option, str(FIXTURES / "clean.md")])
